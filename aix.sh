@@ -1,17 +1,14 @@
 #!/bin/sh
 
-# --- 路径与环境初始化 ---
+# --- 基础环境 ---
 DB_DIR="/etc/aix"
 DB_FILE="$DB_DIR/data.json"
 NFT_TABLE="aix_guard"
 mkdir -p "$DB_DIR"
 [ ! -f "$DB_FILE" ] && echo "{}" > "$DB_FILE"
 
-# --- 内部工具：大数字转换与对齐 ---
-to_bytes() {
-    echo "$1" | awk '{printf "%.0f", $1 * 1073741824}'
-}
-
+# --- 大数字工具 (使用 awk 规避 Alpine sh 溢出) ---
+to_bytes() { echo "$1" | awk '{printf "%.0f", $1 * 1073741824}'; }
 fmt_size() {
     echo "$1" | awk '{
         if ($1 >= 1073741824) printf "%.2f GB", $1/1073741824;
@@ -19,7 +16,7 @@ fmt_size() {
     }'
 }
 
-# --- 流量监控同步逻辑 ---
+# --- 核心同步 (修复 jq 语法冲突的关键函数) ---
 daemon_check() {
     nft add table inet $NFT_TABLE 2>/dev/null
     nft "add chain inet $NFT_TABLE count_chain { type filter hook input priority 0; }" 2>/dev/null
@@ -35,45 +32,33 @@ daemon_check() {
         local expire=$(jq -r ".\"$port\".expire" "$DB_FILE")
         local last_reset=$(jq -r ".\"$port\".last_reset" "$DB_FILE")
         
-        # 1. 30天自动重置
-        if [ $((now_ts - last_reset)) -ge 2592000 ]; then
-            nft reset rule inet $NFT_TABLE count_chain tcp dport $port >/dev/null 2>&1
-            last_reset=$now_ts
-            jq ".\"$port\".last_reset = $last_reset" "$DB_FILE" > "${DB_FILE}.tmp" && mv "${DB_FILE}.tmp" "$DB_FILE"
-        fi
-
-        # 2. 提取字节数
+        # 提取流量并确保是数字
         local cur_bytes=$(echo "$stats" | grep "tcp dport $port" | grep "counter" | sed -n 's/.*bytes \([0-9]*\).*/\1/p')
         [ -z "$cur_bytes" ] && cur_bytes=0
         
-        # 写入数据库，确保 cur_bytes 是纯数字
-        jq ".\"$port\".used = $cur_bytes" "$DB_FILE" > "${DB_FILE}.tmp" && mv "${DB_FILE}.tmp" "$DB_FILE"
+        # 使用 --arg 传参，彻底解决之前截图中的 jq compile error
+        local tmp_json=$(jq --arg p "$port" --arg v "$cur_bytes" '.[$p].used = ($v|tonumber)' "$DB_FILE")
+        echo "$tmp_json" > "$DB_FILE"
 
-        # 3. 封禁判定
-        local is_stop=false
-        local over_limit=$(echo "$cur_bytes $limit" | awk '{if($1 >= $2) print "true"; else print "false"}')
-        [ "$over_limit" = "true" ] && is_stop=true
-        
+        # 判定状态 (支持大数字对比)
+        local is_stop="false"
+        if [ "$(echo "$cur_bytes $limit" | awk '{if($1 >= $2) print 1; else print 0}')" -eq 1 ]; then is_stop="true"; fi
         if [ "$expire" != "永久" ]; then
             local exp_ts=$(date -d "$expire" +%s 2>/dev/null || echo 0)
-            [ "$now_ts" -ge "$exp_ts" ] && is_stop=true
+            if [ "$now_ts" -ge "$exp_ts" ]; then is_stop="true"; fi
         fi
 
-        # 4. 执行防火墙规则
-        if [ "$is_stop" = true ]; then
-            if ! nft list chain inet $NFT_TABLE drop_chain | grep -q "tcp dport $port drop"; then
-                nft add rule inet $NFT_TABLE drop_chain tcp dport $port drop 2>/dev/null
-            fi
+        # 防火墙执行
+        if [ "$is_stop" = "true" ]; then
+            nft add rule inet $NFT_TABLE drop_chain tcp dport $port drop 2>/dev/null
         else
             local handles=$(nft -a list chain inet $NFT_TABLE drop_chain | grep "tcp dport $port drop" | awk '{print $NF}')
-            for h in $handles; do
-                nft delete rule inet $NFT_TABLE drop_chain handle $h 2>/dev/null
-            done
+            for h in $handles; do nft delete rule inet $NFT_TABLE drop_chain handle $h 2>/dev/null; done
         fi
     done
 }
 
-# --- 菜单交互 ---
+# --- 交互界面 ---
 show_menu() {
     clear
     echo "========================================"
@@ -99,55 +84,38 @@ show_menu() {
                 local l=$(jq -r ".\"$port\".limit" "$DB_FILE")
                 local e=$(jq -r ".\"$port\".expire" "$DB_FILE")
                 local s="运行"
-                [ "$(echo "$u $l" | awk '{if($1>=$2) print 1; else print 0}')" -eq 1 ] && s="溢出"
-                if [ "$e" != "永久" ] && [ "$(date +%s)" -ge "$(date -d "$e" +%s 2>/dev/null || echo 0)" ]; then s="过期"; fi
+                if [ "$(echo "$u $l" | awk '{if($1>=$2) print 1; else print 0}')" -eq 1 ]; then s="溢出"; fi
                 printf "%-7s | %-6s | %-12s | %-12s | %-10s\n" "$port" "$s" "$(fmt_size $u)" "$(fmt_size $l)" "$e"
             done
             echo "----------------------------------------------------------------"
-            read -p "按回车键返回主菜单..." dummy; show_menu ;;
-        
+            read -p "按回车键返回..." dummy; show_menu ;;
         2)
             read -p "端口号: " p
             [ -z "$p" ] && show_menu
-            read -p "额度 (GB): " g
-            [ -z "$g" ] && g=100
-            read -p "有效期 (YYYY-MM-DD, 留空永久): " e
-            [ -z "$e" ] && e="永久"
-            
-            jq ".\"$p\" = {\"limit\": $(to_bytes $g), \"used\": 0, \"expire\": \"$e\", \"last_reset\": $(date +%s)}" "$DB_FILE" > "${DB_FILE}.tmp" && mv "${DB_FILE}.tmp" "$DB_FILE"
+            read -p "月额度(GB): " g
+            read -p "有效期(YYYY-MM-DD/留空永久): " e; [ -z "$e" ] && e="永久"
+            local b=$(to_bytes $g)
+            local tmp=$(jq --arg p "$p" --arg b "$b" --arg e "$e" --arg t "$(date +%s)" '.[$p] = {"limit": ($b|tonumber), "used": 0, "expire": $e, "last_reset": ($t|tonumber)}' "$DB_FILE")
+            echo "$tmp" > "$DB_FILE"
             nft add rule inet $NFT_TABLE count_chain tcp dport $p counter accept 2>/dev/null
-            echo "设置已保存。"
-            sleep 1; show_menu ;;
-            
+            echo "设置成功！"; sleep 1; show_menu ;;
         3)
             read -p "重置端口: " p
-            if jq -e ".\"$p\"" "$DB_FILE" >/dev/null; then
-                nft reset rule inet $NFT_TABLE count_chain tcp dport $p >/dev/null 2>&1
-                jq ".\"$p\".last_reset = $(date +%s)" "$DB_FILE" > "${DB_FILE}.tmp" && mv "${DB_FILE}.tmp" "$DB_FILE"
-                echo "流量已重置。"
-            else
-                echo "未找到该端口。"
-            fi
-            sleep 1; show_menu ;;
-
+            nft reset rule inet $NFT_TABLE count_chain tcp dport $p >/dev/null 2>&1
+            local tmp=$(jq --arg p "$p" --arg t "$(date +%s)" '.[$p].last_reset = ($t|tonumber)' "$DB_FILE")
+            echo "$tmp" > "$DB_FILE"
+            echo "已清零！"; sleep 1; show_menu ;;
         4)
             read -p "删除端口: " p
-            jq "del(.\"$p\")" "$DB_FILE" > "${DB_FILE}.tmp" && mv "${DB_FILE}.tmp" "$DB_FILE"
-            local handles=$(nft -a list table inet $NFT_TABLE | grep "tcp dport $p" | awk '{print $NF}')
-            for h in $handles; do nft delete rule inet $NFT_TABLE count_chain handle $h 2>/dev/null; done
-            echo "已删除。"
-            sleep 1; show_menu ;;
-
-        5)
-            daemon_check; echo "同步成功。"; sleep 1; show_menu ;;
-
+            local tmp=$(jq --arg p "$p" 'del(.[$p])' "$DB_FILE")
+            echo "$tmp" > "$DB_FILE"
+            local h=$(nft -a list table inet $NFT_TABLE | grep "tcp dport $p" | awk '{print $NF}')
+            for i in $h; do nft delete rule inet $NFT_TABLE count_chain handle $i 2>/dev/null; done
+            echo "已删除！"; sleep 1; show_menu ;;
+        5) daemon_check; echo "同步完成！"; sleep 1; show_menu ;;
         0) exit 0 ;;
-        *) echo "输入无效。"; sleep 1; show_menu ;;
+        *) echo "无效指令"; sleep 1; show_menu ;;
     esac
 }
 
-if [ "$1" = "daemon" ]; then
-    daemon_check
-else
-    show_menu
-fi
+if [ "$1" = "daemon" ]; then daemon_check; else show_menu; fi
