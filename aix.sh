@@ -1,14 +1,14 @@
 #!/bin/sh
 
-# --- 全局路径与数据库初始化 ---
+# --- 路径与环境初始化 ---
 DB_DIR="/etc/aix"
 DB_FILE="$DB_DIR/data.json"
 NFT_TABLE="aix_guard"
 mkdir -p "$DB_DIR"
 [ ! -f "$DB_FILE" ] && echo "{}" > "$DB_FILE"
 
-# --- 内部工具：使用 awk 处理大数字转换防止溢出 ---
-to_bytes() { 
+# --- 内部工具：大数字转换与对齐 ---
+to_bytes() {
     echo "$1" | awk '{printf "%.0f", $1 * 1073741824}'
 }
 
@@ -19,9 +19,8 @@ fmt_size() {
     }'
 }
 
-# --- 核心逻辑：流量同步与封禁控制 ---
+# --- 流量监控同步逻辑 ---
 daemon_check() {
-    # 确保防火墙表和链存在
     nft add table inet $NFT_TABLE 2>/dev/null
     nft "add chain inet $NFT_TABLE count_chain { type filter hook input priority 0; }" 2>/dev/null
     nft "add chain inet $NFT_TABLE drop_chain { type filter hook input priority 1; }" 2>/dev/null
@@ -29,29 +28,29 @@ daemon_check() {
     local now_ts=$(date +%s)
     local stats=$(nft list table inet $NFT_TABLE 2>/dev/null)
     
-    # 循环处理数据库中的每个端口
     for port in $(jq -r 'keys[]' "$DB_FILE" 2>/dev/null); do
+        [ -z "$port" ] || [ "$port" = "null" ] && continue
+
         local limit=$(jq -r ".\"$port\".limit" "$DB_FILE")
         local expire=$(jq -r ".\"$port\".expire" "$DB_FILE")
         local last_reset=$(jq -r ".\"$port\".last_reset" "$DB_FILE")
         
-        # 1. 30天自动重置检查
+        # 1. 30天自动重置
         if [ $((now_ts - last_reset)) -ge 2592000 ]; then
             nft reset rule inet $NFT_TABLE count_chain tcp dport $port >/dev/null 2>&1
             last_reset=$now_ts
             jq ".\"$port\".last_reset = $last_reset" "$DB_FILE" > "${DB_FILE}.tmp" && mv "${DB_FILE}.tmp" "$DB_FILE"
         fi
 
-        # 2. 从内核提取字节数 (精准提取 bytes 后的数字)
+        # 2. 提取字节数
         local cur_bytes=$(echo "$stats" | grep "tcp dport $port" | grep "counter" | sed -n 's/.*bytes \([0-9]*\).*/\1/p')
         [ -z "$cur_bytes" ] && cur_bytes=0
         
-        # 更新数据库中的已用流量
+        # 写入数据库，确保 cur_bytes 是纯数字
         jq ".\"$port\".used = $cur_bytes" "$DB_FILE" > "${DB_FILE}.tmp" && mv "${DB_FILE}.tmp" "$DB_FILE"
 
-        # 3. 封禁判定逻辑 (支持大数字对比)
+        # 3. 封禁判定
         local is_stop=false
-        # 使用 awk 进行大数字对比
         local over_limit=$(echo "$cur_bytes $limit" | awk '{if($1 >= $2) print "true"; else print "false"}')
         [ "$over_limit" = "true" ] && is_stop=true
         
@@ -60,7 +59,7 @@ daemon_check() {
             [ "$now_ts" -ge "$exp_ts" ] && is_stop=true
         fi
 
-        # 4. 执行防火墙封禁或解封
+        # 4. 执行防火墙规则
         if [ "$is_stop" = true ]; then
             if ! nft list chain inet $NFT_TABLE drop_chain | grep -q "tcp dport $port drop"; then
                 nft add rule inet $NFT_TABLE drop_chain tcp dport $port drop 2>/dev/null
@@ -74,7 +73,7 @@ daemon_check() {
     done
 }
 
-# --- 主交互菜单 ---
+# --- 菜单交互 ---
 show_menu() {
     clear
     echo "========================================"
@@ -108,49 +107,45 @@ show_menu() {
             read -p "按回车键返回主菜单..." dummy; show_menu ;;
         
         2)
-            read -p "请输入端口号 (如 13031): " p
+            read -p "端口号: " p
             [ -z "$p" ] && show_menu
-            read -p "设置月流量额度 (GB): " g
-            [ -z "$g" ] && g=1000
+            read -p "额度 (GB): " g
+            [ -z "$g" ] && g=100
             read -p "有效期 (YYYY-MM-DD, 留空永久): " e
             [ -z "$e" ] && e="永久"
             
             jq ".\"$p\" = {\"limit\": $(to_bytes $g), \"used\": 0, \"expire\": \"$e\", \"last_reset\": $(date +%s)}" "$DB_FILE" > "${DB_FILE}.tmp" && mv "${DB_FILE}.tmp" "$DB_FILE"
             nft add rule inet $NFT_TABLE count_chain tcp dport $p counter accept 2>/dev/null
-            echo "端口 $p 配置已保存！"
+            echo "设置已保存。"
             sleep 1; show_menu ;;
             
         3)
-            read -p "输入要清零流量的端口: " p
+            read -p "重置端口: " p
             if jq -e ".\"$p\"" "$DB_FILE" >/dev/null; then
                 nft reset rule inet $NFT_TABLE count_chain tcp dport $p >/dev/null 2>&1
                 jq ".\"$p\".last_reset = $(date +%s)" "$DB_FILE" > "${DB_FILE}.tmp" && mv "${DB_FILE}.tmp" "$DB_FILE"
-                echo "端口 $p 流量已重置。"
+                echo "流量已重置。"
             else
-                echo "错误：未找到端口 $p"
+                echo "未找到该端口。"
             fi
             sleep 1; show_menu ;;
 
         4)
-            read -p "输入要删除的端口: " p
+            read -p "删除端口: " p
             jq "del(.\"$p\")" "$DB_FILE" > "${DB_FILE}.tmp" && mv "${DB_FILE}.tmp" "$DB_FILE"
             local handles=$(nft -a list table inet $NFT_TABLE | grep "tcp dport $p" | awk '{print $NF}')
             for h in $handles; do nft delete rule inet $NFT_TABLE count_chain handle $h 2>/dev/null; done
-            echo "端口 $p 已删除。"
+            echo "已删除。"
             sleep 1; show_menu ;;
 
         5)
-            daemon_check; echo "同步成功！"; sleep 1; show_menu ;;
+            daemon_check; echo "同步成功。"; sleep 1; show_menu ;;
 
         0) exit 0 ;;
-
-        *)
-            echo "无效选项，请重新输入。"
-            sleep 1; show_menu ;;
+        *) echo "输入无效。"; sleep 1; show_menu ;;
     esac
 }
 
-# --- 脚本入口判定 ---
 if [ "$1" = "daemon" ]; then
     daemon_check
 else
