@@ -8,7 +8,7 @@ echo "🚀 开始安装 AIX-Xray 管理工具..."
 mkdir -p ~/bin
 
 # 2. 下载主脚本（请替换为你的 GitHub Raw 链接）
-RAW_URL="https://raw.githubusercontent.com/你的GitHub用户名/AIX-Xray/main/aix"
+RAW_URL="https://raw.githubusercontent.com/321CMO/AIX/main/aix"
 echo "📥 下载脚本到 ~/bin/aix ..."
 if curl -fsSL "$RAW_URL" -o ~/bin/aix; then
     echo "✅ 下载成功"
